@@ -4,7 +4,31 @@ import { WebSocketServer } from "ws";
 import { nanoid } from "nanoid";
 
 const app = express();
-app.use(cors());
+
+// Разрешаем GitHub Pages origin (можно '*' пока отладка)
+const ALLOW_ORIGIN = "https://kaplinskiy.github.io";
+
+// Базовый CORS для всех обычных ответов
+app.use(cors({
+  origin: ALLOW_ORIGIN,
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type"],
+}));
+
+app.options("/rooms", (req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", ALLOW_ORIGIN);
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.status(204).end();
+  });
+
+// Явно отвечаем на preflight для всех путей
+app.options("*", cors({
+  origin: ALLOW_ORIGIN,
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type"],
+}));
+
 app.use(express.json({ limit: "256kb" }));
 
 // --- простая память-комнат: { [roomId]: { createdAt, members: Map(memberId -> ws), roles: Map(ws -> role) } }
