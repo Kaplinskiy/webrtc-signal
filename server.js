@@ -57,6 +57,12 @@ const server = app.listen(process.env.PORT || 3000, () => {
 
 // WS: wss://host/ws?roomId=XXXX&role=caller|callee
 const wss = new WebSocketServer({ noServer: true });
+// серверный пинг всем живым клиентам
+setInterval(() => {
+    wss.clients.forEach((client) => {
+      try { client.send(JSON.stringify({ type: "ping", t: Date.now() })); } catch {}
+    });
+  }, 20000);
 
 server.on("upgrade", (req, socket, head) => {
   if (!req.url.startsWith("/ws")) return socket.destroy();
@@ -106,12 +112,15 @@ wss.on("connection", (ws, req) => {
     }
   });
 
-  ws.on("close", () => {
-    console.log("[leave]", roomId, memberId);
+  ws.on("error", (err) => {
+    console.error("[ws.error]", roomId, err?.message || err);
+  });
+  
+  ws.on("close", (code, reason) => {
+    console.log("[ws.close]", roomId, code, reason?.toString());
     room.members.delete(memberId);
     room.roles.delete(ws);
     broadcast(roomId, { type: "member.left", roomId, memberId });
-    // удалить пустую комнату
     if (room.members.size === 0) {
       rooms.delete(roomId);
       console.log("[room.gc]", roomId);
