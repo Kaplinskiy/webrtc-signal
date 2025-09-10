@@ -6,8 +6,21 @@ import { nanoid } from "nanoid";
 const app = express();
 
 // Разрешаем GitHub Pages origin (можно '*' пока отладка)
-const ALLOW_ORIGIN = "https://kaplinskiy.github.io";
+import cors from 'cors';
 
+const ALLOW = [
+  'https://kaplinskiy.github.io',
+  'https://call.zababba.com',
+  'https://zababba.com'
+];
+
+app.use(cors({
+  origin: (origin, cb) => {
+    // разрешаем запросы без Origin (например, curl) и из нашего списка
+    if (!origin || ALLOW.includes(origin)) return cb(null, true);
+    return cb(new Error('CORS blocked: ' + origin));
+  }
+}));
 // Базовый CORS для всех обычных ответов
 app.use(cors({
   origin: ALLOW_ORIGIN,
