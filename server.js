@@ -1,3 +1,4 @@
+// server.js  — чистая версия
 import express from "express";
 import cors from "cors";
 import { WebSocketServer } from "ws";
@@ -5,80 +6,78 @@ import { nanoid } from "nanoid";
 
 const app = express();
 
-// Разрешаем GitHub Pages origin (можно '*' пока отладка)
-import cors from 'cors';
+// Разрешённые фронтенды
+const ALLOW = new Set([
+  "https://kaplinskiy.github.io",
+  "https://call.zababba.com",
+  "https://zababba.com",
+]);
 
-const ALLOW = [
-  'https://kaplinskiy.github.io',
-  'https://call.zababba.com',
-  'https://zababba.com'
-];
-
-app.use(cors({
-  origin: (origin, cb) => {
-    // разрешаем запросы без Origin (например, curl) и из нашего списка
-    if (!origin || ALLOW.includes(origin)) return cb(null, true);
-    return cb(new Error('CORS blocked: ' + origin));
+// Единый CORS-мидлвар (хватает для всех HTTP-ручек, включая preflight)
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (!origin || ALLOW.has(origin)) {
+    // Отражаем конкретный origin (и помним Vary)
+    res.header("Access-Control-Allow-Origin", origin || "*");
+    res.header("Vary", "Origin");
+    res.header("Access-Control-Allow-Credentials", "true");
+    res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.header("Access-Control-Allow-Headers", "Content-Type");
+    if (req.method === "OPTIONS") return res.sendStatus(204);
+    return next();
   }
-}));
-// Базовый CORS для всех обычных ответов
-app.use(cors({
-  origin: ALLOW_ORIGIN,
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type"],
-}));
-
-app.options("/rooms", (req, res) => {
-    res.setHeader("Access-Control-Allow-Origin", ALLOW_ORIGIN);
-    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-    res.status(204).end();
-  });
-
-// Явно отвечаем на preflight для всех путей
-app.options("*", cors({
-  origin: ALLOW_ORIGIN,
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type"],
-}));
+  return res.status(403).json({ ok: false, error: "CORS blocked", origin });
+});
 
 app.use(express.json({ limit: "256kb" }));
 
-// --- простая память-комнат: { [roomId]: { createdAt, members: Map(memberId -> ws), roles: Map(ws -> role) } }
-const rooms = new Map();
-const ROOM_TTL_MS = 10 * 60 * 1000; // 10 минут
+// Память комнат
+const rooms = new Map(); // roomId -> { createdAt, members: Map(memberId->ws), roles: Map(ws->role) }
+const ROOM_TTL_MS = 10 * 60 * 1000;
 
-// health + версия
+// health
 app.get("/health", (req, res) => {
   res.json({ ok: true, version: "0.1.0", rooms: rooms.size, ts: Date.now() });
 });
 
-// создать комнату и одноразовую ссылку
+// создать комнату
 app.post("/rooms", (req, res) => {
   const roomId = (req.body?.roomId || nanoid(6)).toUpperCase();
   if (!rooms.has(roomId)) {
     rooms.set(roomId, { createdAt: Date.now(), members: new Map(), roles: new Map() });
     console.log("[room.created]", roomId);
   }
-  // joinLink: клиент сам подставит свой frontend-домен; здесь просто roomId
-  res.json({ roomId, expiresInSec: ROOM_TTL_MS / 1000 });
+  res.json({ ok: true, roomId, expiresInSec: ROOM_TTL_MS / 1000 });
 });
 
-const server = app.listen(process.env.PORT || 3000, () => {
+// HTTP-сервер
+const PORT = process.env.PORT || 10000; // Render подставляет PORT
+const server = app.listen(PORT, "0.0.0.0", () => {
   console.log("HTTP on", server.address().port);
 });
 
-// WS: wss://host/ws?roomId=XXXX&role=caller|callee
+// WebSocket (с апгрейдом и проверкой Origin)
 const wss = new WebSocketServer({ noServer: true });
-// серверный пинг всем живым клиентам
+
+// keep-alive ping всем клиентам
 setInterval(() => {
-    wss.clients.forEach((client) => {
-      try { client.send(JSON.stringify({ type: "ping", t: Date.now() })); } catch {}
-    });
-  }, 20000);
+  wss.clients.forEach((client) => {
+    try { client.send(JSON.stringify({ type: "ping", t: Date.now() })); } catch {}
+  });
+}, 20000);
 
 server.on("upgrade", (req, socket, head) => {
+  // Проверяем путь
   if (!req.url.startsWith("/ws")) return socket.destroy();
+
+  // Проверяем Origin (тот же allowlist)
+  const origin = req.headers.origin;
+  if (origin && !ALLOW.has(origin)) {
+    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
@@ -103,7 +102,15 @@ wss.on("connection", (ws, req) => {
   room.roles.set(ws, role);
   console.log("[join]", roomId, memberId, role);
 
-  // сообщаем второму участнику о входе
+  // Приветствие + краткий статус
+  ws.send(JSON.stringify({
+    type: "hello",
+    roomId, memberId, role,
+    createdAt: room.createdAt,
+    members: [...room.members.keys()]
+  }));
+
+  // Сообщаем всем о входе (в т.ч. второму участнику)
   broadcast(roomId, { type: "member.joined", roomId, memberId, role });
 
   ws.on("message", (buf) => {
@@ -114,7 +121,6 @@ wss.on("connection", (ws, req) => {
     const { type, payload } = msg || {};
     if (!type) return;
 
-    // пересылаем партнёру только ограниченные типы
     if (["offer", "answer", "ice"].includes(type)) {
       console.log(`[signal] ${roomId} ${type} from ${memberId}`);
       relayToPeer(roomId, memberId, { type, roomId, from: memberId, payload });
@@ -128,7 +134,7 @@ wss.on("connection", (ws, req) => {
   ws.on("error", (err) => {
     console.error("[ws.error]", roomId, err?.message || err);
   });
-  
+
   ws.on("close", (code, reason) => {
     console.log("[ws.close]", roomId, code, reason?.toString());
     room.members.delete(memberId);
@@ -139,19 +145,9 @@ wss.on("connection", (ws, req) => {
       console.log("[room.gc]", roomId);
     }
   });
-
-  // приветствие + краткий статус
-  ws.send(JSON.stringify({
-    type: "hello",
-    roomId,
-    memberId,
-    role,
-    createdAt: rooms.get(roomId)?.createdAt,
-    members: [...rooms.get(roomId)?.members.keys()]
-  }));
 });
 
-// переслать сообщению единственному «партнёру» в комнате
+// отправить партнёру (в комнате макс. 2)
 function relayToPeer(roomId, fromMemberId, msg) {
   const room = rooms.get(roomId);
   if (!room) return;
@@ -172,7 +168,7 @@ function broadcast(roomId, msg) {
   }
 }
 
-// простая очистка старых комнат
+// GC старых комнат
 setInterval(() => {
   const now = Date.now();
   for (const [roomId, room] of rooms.entries()) {
